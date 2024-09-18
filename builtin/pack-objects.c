@@ -39,6 +39,9 @@
 #include "promisor-remote.h"
 #include "pack-mtimes.h"
 #include "parse-options.h"
+#include "blob.h"
+#include "tree.h"
+#include "path-walk.h"
 
 /*
  * Objects we are going to pack are collected in the `to_pack` structure.
@@ -46,6 +49,9 @@
  * that can resolve SHA1s to their position in the array.
  */
 static struct packing_data to_pack;
+
+static FILE *delta_file;
+static int delta_file_nr;
 
 static inline struct object_entry *oe_delta(
 		const struct packing_data *pack,
@@ -215,6 +221,7 @@ static int delta_search_threads;
 static int pack_to_stdout;
 static int sparse;
 static int thin;
+static int path_walk;
 static int num_preferred_base;
 static struct progress *progress_state;
 
@@ -266,6 +273,14 @@ struct configured_exclusion {
 static struct oidmap configured_exclusions;
 
 static struct oidset excluded_by_config;
+static int use_full_name_hash;
+
+static inline uint32_t pack_name_hash_fn(const char *name)
+{
+	if (use_full_name_hash)
+		return pack_full_name_hash(name);
+	return pack_name_hash(name);
+}
 
 /*
  * stats
@@ -504,6 +519,14 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 	hdrlen = encode_in_pack_object_header(header, sizeof(header),
 					      type, size);
 
+	if (delta_file) {
+		if (delta_file_nr++)
+			fprintf(delta_file, ",\n");
+		fprintf(delta_file, "\t\t{\n");
+		fprintf(delta_file, "\t\t\t\"oid\" : \"%s\",\n", oid_to_hex(&entry->idx.oid));
+		fprintf(delta_file, "\t\t\t\"size\" : %"PRIuMAX",\n", (uintmax_t)datalen);
+	}
+
 	if (type == OBJ_OFS_DELTA) {
 		/*
 		 * Deltas with relative base contain an additional
@@ -524,6 +547,11 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 		hashwrite(f, header, hdrlen);
 		hashwrite(f, dheader + pos, sizeof(dheader) - pos);
 		hdrlen += sizeof(dheader) - pos;
+		if (delta_file) {
+			fprintf(delta_file, "\t\t\t\"delta_type\" : \"OFS\",\n");
+			fprintf(delta_file, "\t\t\t\"offset\" : %"PRIuMAX",\n", (uintmax_t)ofs);
+			fprintf(delta_file, "\t\t\t\"delta_base\" : \"%s\",\n", oid_to_hex(&DELTA(entry)->idx.oid));
+		}
 	} else if (type == OBJ_REF_DELTA) {
 		/*
 		 * Deltas with a base reference contain
@@ -538,6 +566,10 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 		hashwrite(f, header, hdrlen);
 		hashwrite(f, DELTA(entry)->idx.oid.hash, hashsz);
 		hdrlen += hashsz;
+		if (delta_file) {
+			fprintf(delta_file, "\t\t\t\"delta_type\" : \"REF\",\n");
+			fprintf(delta_file, "\t\t\t\"delta_base\" : \"%s\",\n", oid_to_hex(&DELTA(entry)->idx.oid));
+		}
 	} else {
 		if (limit && hdrlen + datalen + hashsz >= limit) {
 			if (st)
@@ -547,6 +579,10 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 		}
 		hashwrite(f, header, hdrlen);
 	}
+
+	if (delta_file)
+		fprintf(delta_file, "\t\t\t\"reused\" : false\n\t\t}");
+
 	if (st) {
 		datalen = write_large_blob_data(st, f, &entry->idx.oid);
 		close_istream(st);
@@ -607,6 +643,14 @@ static off_t write_reuse_object(struct hashfile *f, struct object_entry *entry,
 		return write_no_reuse_object(f, entry, limit, usable_delta);
 	}
 
+	if (delta_file) {
+		if (delta_file_nr++)
+			fprintf(delta_file, ",\n");
+		fprintf(delta_file, "\t\t{\n");
+		fprintf(delta_file, "\t\t\t\"oid\" : \"%s\",\n", oid_to_hex(&entry->idx.oid));
+		fprintf(delta_file, "\t\t\t\"size\" : %"PRIuMAX",\n", (uintmax_t)entry_size);
+	}
+
 	if (type == OBJ_OFS_DELTA) {
 		off_t ofs = entry->idx.offset - DELTA(entry)->idx.offset;
 		unsigned pos = sizeof(dheader) - 1;
@@ -621,6 +665,12 @@ static off_t write_reuse_object(struct hashfile *f, struct object_entry *entry,
 		hashwrite(f, dheader + pos, sizeof(dheader) - pos);
 		hdrlen += sizeof(dheader) - pos;
 		reused_delta++;
+
+		if (delta_file) {
+			fprintf(delta_file, "\t\t\t\"delta_type\" : \"OFS\",\n");
+			fprintf(delta_file, "\t\t\t\"offset\" : %"PRIuMAX",\n", (uintmax_t)ofs);
+			fprintf(delta_file, "\t\t\t\"delta_base\" : \"%s\",\n", oid_to_hex(&DELTA(entry)->idx.oid));
+		}
 	} else if (type == OBJ_REF_DELTA) {
 		if (limit && hdrlen + hashsz + datalen + hashsz >= limit) {
 			unuse_pack(&w_curs);
@@ -630,6 +680,10 @@ static off_t write_reuse_object(struct hashfile *f, struct object_entry *entry,
 		hashwrite(f, DELTA(entry)->idx.oid.hash, hashsz);
 		hdrlen += hashsz;
 		reused_delta++;
+		if (delta_file) {
+			fprintf(delta_file, "\t\t\t\"delta_type\" : \"REF\",\n");
+			fprintf(delta_file, "\t\t\t\"delta_base\" : \"%s\",\n", oid_to_hex(&DELTA(entry)->idx.oid));
+		}
 	} else {
 		if (limit && hdrlen + datalen + hashsz >= limit) {
 			unuse_pack(&w_curs);
@@ -640,6 +694,10 @@ static off_t write_reuse_object(struct hashfile *f, struct object_entry *entry,
 	copy_pack_data(f, p, &w_curs, offset, datalen);
 	unuse_pack(&w_curs);
 	reused++;
+
+	if (delta_file)
+		fprintf(delta_file, "\t\t\t\"reused\" : true\n\t\t}");
+
 	return hdrlen + datalen;
 }
 
@@ -1252,6 +1310,11 @@ static void write_pack_file(void)
 	ALLOC_ARRAY(written_list, to_pack.nr_objects);
 	write_order = compute_write_order();
 
+	if (delta_file) {
+		fprintf(delta_file, "{\n\t\"num_objects\" : %"PRIu32",\n", to_pack.nr_objects);
+		fprintf(delta_file, "\t\"objects\" : [\n");
+	}
+
 	do {
 		unsigned char hash[GIT_MAX_RAWSZ];
 		char *pack_tmp_name = NULL;
@@ -1400,6 +1463,9 @@ static void write_pack_file(void)
 		    written, nr_result);
 	trace2_data_intmax("pack-objects", the_repository,
 			   "write_pack_file/wrote", nr_result);
+
+	if (delta_file)
+		fprintf(delta_file, "\n\t]\n}");
 }
 
 static int no_try_delta(const char *path)
@@ -1670,7 +1736,7 @@ static int add_object_entry(const struct object_id *oid, enum object_type type,
 		return 0;
 	}
 
-	create_object_entry(oid, type, pack_name_hash(name),
+	create_object_entry(oid, type, pack_name_hash_fn(name),
 			    exclude, name && no_try_delta(name),
 			    found_pack, found_offset);
 	return 1;
@@ -1884,7 +1950,7 @@ static void add_preferred_base_object(const char *name)
 {
 	struct pbase_tree *it;
 	size_t cmplen;
-	unsigned hash = pack_name_hash(name);
+	unsigned hash = pack_name_hash_fn(name);
 
 	if (!num_preferred_base || check_pbase_path(hash))
 		return;
@@ -3139,6 +3205,35 @@ static int add_ref_tag(const char *tag UNUSED, const struct object_id *oid,
 	return 0;
 }
 
+static int should_attempt_deltas(struct object_entry *entry)
+{
+	if (DELTA(entry))
+		/* This happens if we decided to reuse existing
+		 * delta from a pack.  "reuse_delta &&" is implied.
+		 */
+		return 0;
+
+	if (!entry->type_valid || oe_size_less_than(&to_pack, entry, 50))
+		return 0;
+
+	if (entry->no_try_delta)
+		return 0;
+
+	if (!entry->preferred_base) {
+		if (oe_type(entry) < 0)
+			die(_("unable to get type of object %s"),
+				oid_to_hex(&entry->idx.oid));
+	} else if (oe_type(entry) < 0) {
+		/*
+		 * This object is not found, but we
+		 * don't have to include it anyway.
+		 */
+		return 0;
+	}
+
+	return 1;
+}
+
 static void prepare_pack(int window, int depth)
 {
 	struct object_entry **delta_list;
@@ -3169,33 +3264,11 @@ static void prepare_pack(int window, int depth)
 	for (i = 0; i < to_pack.nr_objects; i++) {
 		struct object_entry *entry = to_pack.objects + i;
 
-		if (DELTA(entry))
-			/* This happens if we decided to reuse existing
-			 * delta from a pack.  "reuse_delta &&" is implied.
-			 */
+		if (!should_attempt_deltas(entry))
 			continue;
 
-		if (!entry->type_valid ||
-		    oe_size_less_than(&to_pack, entry, 50))
-			continue;
-
-		if (entry->no_try_delta)
-			continue;
-
-		if (!entry->preferred_base) {
+		if (!entry->preferred_base)
 			nr_deltas++;
-			if (oe_type(entry) < 0)
-				die(_("unable to get type of object %s"),
-				    oid_to_hex(&entry->idx.oid));
-		} else {
-			if (oe_type(entry) < 0) {
-				/*
-				 * This object is not found, but we
-				 * don't have to include it anyway.
-				 */
-				continue;
-			}
-		}
 
 		delta_list[n++] = entry;
 	}
@@ -3394,7 +3467,7 @@ static void show_object_pack_hint(struct object *object, const char *name,
 	 * here using a now in order to perhaps improve the delta selection
 	 * process.
 	 */
-	oe->hash = pack_name_hash(name);
+	oe->hash = pack_name_hash_fn(name);
 	oe->no_try_delta = name && no_try_delta(name);
 
 	stdin_packs_hints_nr++;
@@ -3544,7 +3617,7 @@ static void add_cruft_object_entry(const struct object_id *oid, enum object_type
 	entry = packlist_find(&to_pack, oid);
 	if (entry) {
 		if (name) {
-			entry->hash = pack_name_hash(name);
+			entry->hash = pack_name_hash_fn(name);
 			entry->no_try_delta = no_try_delta(name);
 		}
 	} else {
@@ -3567,7 +3640,7 @@ static void add_cruft_object_entry(const struct object_id *oid, enum object_type
 			return;
 		}
 
-		entry = create_object_entry(oid, type, pack_name_hash(name),
+		entry = create_object_entry(oid, type, pack_name_hash_fn(name),
 					    0, name && no_try_delta(name),
 					    pack, offset);
 	}
@@ -4109,6 +4182,117 @@ static void mark_bitmap_preferred_tips(void)
 	}
 }
 
+static inline int is_oid_interesting(struct repository *repo,
+				     struct object_id *oid,
+				     enum object_type type)
+{
+	if (type == OBJ_TAG) {
+		struct tag *t = lookup_tag(repo, oid);
+		return t && !(t->object.flags & UNINTERESTING);
+	}
+
+	if (type == OBJ_COMMIT) {
+		struct commit *c = lookup_commit(repo, oid);
+		return c && !(c->object.flags & UNINTERESTING);
+	}
+
+	if (type == OBJ_TREE) {
+		struct tree *t = lookup_tree(repo, oid);
+		return t && !(t->object.flags & UNINTERESTING);
+	}
+
+	if (type == OBJ_BLOB) {
+		struct blob *b = lookup_blob(repo, oid);
+		return b && !(b->object.flags & UNINTERESTING);
+	}
+
+	return 0;
+}
+
+static int add_objects_by_path(const char *path,
+			       struct oid_array *oids,
+			       enum object_type type,
+			       void *data)
+{
+	struct object_entry **delta_list;
+	size_t oe_start = to_pack.nr_objects;
+	size_t oe_end;
+	unsigned int sub_list_size;
+	unsigned int *processed = data;
+
+	/*
+	 * First, add all objects to the packing data, including the ones
+	 * marked UNINTERESTING (translated to 'exclude') as they can be
+	 * used as delta bases.
+	 */
+	for (size_t i = 0; i < oids->nr; i++) {
+		struct object_id *oid = &oids->oid[i];
+		int exclude = !is_oid_interesting(the_repository, oid, type);
+		add_object_entry(oid, type, path, exclude);
+	}
+
+	oe_end = to_pack.nr_objects;
+
+	/* We can skip delta calculations if it is a no-op. */
+	if (oe_end == oe_start || !window)
+		return 0;
+
+	sub_list_size = 0;
+	ALLOC_ARRAY(delta_list, oe_end - oe_start);
+
+	for (size_t i = 0; i < oe_end - oe_start; i++) {
+		struct object_entry *entry = to_pack.objects + oe_start + i;
+
+		if (!should_attempt_deltas(entry))
+			continue;
+
+		delta_list[sub_list_size++] = entry;
+	}
+
+	/*
+	 * Find delta bases among this list of objects that all match the same
+	 * path. This causes the delta compression to be interleaved in the
+	 * object walk, which can lead to confusing progress indicators. This is
+	 * also incompatible with threaded delta calculations. In the future,
+	 * consider creating a list of regions in the full to_pack.objects array
+	 * that could be picked up by the threaded delta computation.
+	 */
+	if (sub_list_size && window) {
+		QSORT(delta_list, sub_list_size, type_size_sort);
+		find_deltas(delta_list, &sub_list_size, window, depth, processed);
+	}
+
+	free(delta_list);
+	return 0;
+}
+
+static void get_object_list_path_walk(struct rev_info *revs)
+{
+	struct path_walk_info info = PATH_WALK_INFO_INIT;
+	unsigned int processed = 0;
+
+	info.revs = revs;
+
+	info.revs->tag_objects = 1;
+	info.tags = 1;
+	info.commits = 1;
+	info.trees = 1;
+	info.blobs = 1;
+	info.path_fn = add_objects_by_path;
+	info.path_fn_data = &processed;
+
+	/*
+	 * Allow the --[no-]sparse option to be interesting here, if only
+	 * for testing purposes. Paths with no interesting objects will not
+	 * contribute to the resulting pack, but only create noisy preferred
+	 * base objects.
+	 */
+	info.prune_all_uninteresting = sparse;
+
+	if (walk_objects_by_path(&info))
+		die(_("failed to pack objects via path-walk"));
+}
+
 static void get_object_list(struct rev_info *revs, int ac, const char **av)
 {
 	struct setup_revision_opt s_r_opt = {
@@ -4155,7 +4339,7 @@ static void get_object_list(struct rev_info *revs, int ac, const char **av)
 
 	warn_on_object_refname_ambiguity = save_warning;
 
-	if (use_bitmap_index && !get_object_list_from_bitmap(revs))
+	if (use_bitmap_index && !path_walk && !get_object_list_from_bitmap(revs))
 		return;
 
 	if (use_delta_islands)
@@ -4164,15 +4348,19 @@ static void get_object_list(struct rev_info *revs, int ac, const char **av)
 	if (write_bitmap_index)
 		mark_bitmap_preferred_tips();
 
-	if (prepare_revision_walk(revs))
-		die(_("revision walk setup failed"));
-	mark_edges_uninteresting(revs, show_edge, sparse);
-
 	if (!fn_show_object)
 		fn_show_object = show_object;
-	traverse_commit_list(revs,
-			     show_commit, fn_show_object,
-			     NULL);
+
+	if (path_walk) {
+		get_object_list_path_walk(revs);
+	} else {
+		if (prepare_revision_walk(revs))
+			die(_("revision walk setup failed"));
+		mark_edges_uninteresting(revs, show_edge, sparse);
+		traverse_commit_list(revs,
+				show_commit, fn_show_object,
+				NULL);
+	}
 
 	if (unpack_unreachable_expiration) {
 		revs->ignore_missing_links = 1;
@@ -4295,6 +4483,7 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 	struct string_list keep_pack_list = STRING_LIST_INIT_NODUP;
 	struct list_objects_filter_options filter_options =
 		LIST_OBJECTS_FILTER_INIT;
+	const char *delta_file_name = NULL;
 
 	struct option pack_objects_options[] = {
 		OPT_CALLBACK_F('q', "quiet", &progress, NULL,
@@ -4367,6 +4556,8 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 			 N_("use the sparse reachability algorithm")),
 		OPT_BOOL(0, "thin", &thin,
 			 N_("create thin packs")),
+		OPT_BOOL(0, "path-walk", &path_walk,
+			 N_("use the path-walk API to walk objects when possible")),
 		OPT_BOOL(0, "shallow", &shallow,
 			 N_("create packs suitable for shallow fetches")),
 		OPT_BOOL(0, "honor-pack-keep", &ignore_packed_keep_on_disk,
@@ -4397,6 +4588,11 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 		OPT_STRING_LIST(0, "uri-protocol", &uri_protocols,
 				N_("protocol"),
 				N_("exclude any configured uploadpack.blobpackfileuri with this protocol")),
+		OPT_BOOL(0, "full-name-hash", &use_full_name_hash,
+			 N_("optimize delta compression across identical path names over time")),
+		OPT_STRING(0, "delta-file", &delta_file_name,
+				N_("filename"),
+				N_("output delta compression details to the given file")),
 		OPT_END(),
 	};
 
@@ -4405,11 +4601,14 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 
 	disable_replace_refs();
 
+	path_walk = git_env_bool("GIT_TEST_PACK_PATH_WALK", -1);
 	sparse = git_env_bool("GIT_TEST_PACK_SPARSE", -1);
 	if (the_repository->gitdir) {
 		prepare_repo_settings(the_repository);
 		if (sparse < 0)
 			sparse = the_repository->settings.pack_use_sparse;
+		if (path_walk < 0)
+			path_walk = the_repository->settings.pack_use_path_walk;
 		if (the_repository->settings.pack_use_multi_pack_reuse)
 			allow_pack_reuse = MULTI_PACK_REUSE;
 	}
@@ -4431,6 +4630,12 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 	if (pack_to_stdout != !base_name || argc)
 		usage_with_options(pack_usage, pack_objects_options);
 
+	if (delta_file_name) {
+		delta_file = fopen(delta_file_name, "w");
+		if (!delta_file)
+			die_errno("failed to open '%s'", delta_file_name);
+		trace2_printf("opened '%s' for writing deltas", delta_file_name);
+	}
 	if (depth < 0)
 		depth = 0;
 	if (depth >= (1 << OE_DEPTH_BITS)) {
@@ -4447,7 +4652,19 @@ int cmd_pack_objects(int argc, const char **argv, const char *prefix)
 		window = 0;
 
 	strvec_push(&rp, "pack-objects");
-	if (thin) {
+
+	if (path_walk && filter_options.choice) {
+		warning(_("cannot use --filter with --path-walk"));
+		path_walk = 0;
+	}
+	if (path_walk) {
+		strvec_push(&rp, "--boundary");
+		 /*
+		  * We must disable the bitmaps because we are removing
+		  * the --objects / --objects-edge[-aggressive] options.
+		  */
+		use_bitmap_index = 0;
+	} else if (thin) {
 		use_internal_rev_list = 1;
 		strvec_push(&rp, shallow
 				? "--objects-edge-aggressive"
@@ -4641,6 +4858,11 @@ cleanup:
 	clear_packing_data(&to_pack);
 	list_objects_filter_release(&filter_options);
 	strvec_clear(&rp);
+
+	if (delta_file) {
+		fflush(delta_file);
+		fclose(delta_file);
+	}
 
 	return 0;
 }
