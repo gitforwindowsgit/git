@@ -249,3 +249,4 @@ Release/
 *.dSYM
 /contrib/buildsystems/out
 CMakeSettings.json
+build*/
